@@ -1,0 +1,14 @@
+intervention, start_date, stop_date
+RecommendHomeOffice, 10.03.2020,
+ProhibitGroups5_20, 12.03.2020, 07.05.2020
+ProhibitGroups21_50, 12.03.2020,  07.05.2020
+ProhibitGroups50+, 12.03.2020,
+RecommendNoPublicTransport, 12.03.2020, 05.05.2020
+RecommendRedPublicTransport, 12.03.2020, 
+CloseSchool1, 12.03.2020, 27.04.2020
+CloseSchool2, 12.03.2020, 11.05.2020
+CloseKindergarten, 12.03.2020,20.04.2020
+RecommendNoForeignTravel, 14.03.2020,
+ProhibitSleepCottage, 19.03.2020,20.04.2020
+RecommendNoMeetings5p, 24.03.2020,
+OpenServices,12.03.2020,20.04.2020

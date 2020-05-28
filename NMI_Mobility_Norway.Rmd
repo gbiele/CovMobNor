@@ -1,0 +1,567 @@
+---
+title: "Associations of covid-19 non-medical interventions with mobility patterns in Norway"
+author: "Guido Biele"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(magrittr)
+library(tidybayes)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(rstanarm)
+library(brms)
+options(mc.cores = 4)
+parallel:::setDefaultClusterOptions(setup_strategy = "sequential")
+theme_set(
+  theme_base() + 
+    theme(axis.ticks.length = unit(2,"pt"),
+          axis.title = element_text(size = 11,
+                                    margin = margin(0,0,0,0)),
+          axis.text = element_text(size = 10,
+                                   margin = margin(0,0,0,0)),
+          strip.text.x = element_text(size = 11,
+                                      margin = margin(0,0,0,0)),
+          plot.background = element_rect(linetype = "blank")))
+```
+
+## Introduction
+
+This short note describes associations of non-medical interventions against covid-19 with mobility on Norway as observable in publicly available data.
+
+## Data
+
+We download the data from Google and Apple.
+This is easy for Google.
+```{r download_mobility_data, eval = F}
+goo = fread("https://www.gstatic.com/covid19/mobility/Global_Mobility_Report.csv")
+save(goo, file = "GoogleMobilityData.Rdata")
+```
+Apple is more complicated. There are  few packages with Apple mobility data, bu they do tons of other stuff that we don't need here. This instruction for manual download didn't work for me because I could not install the `chromote` package. So I simply downloaded the data manually from here: https://www.apple.com/covid19/mobility/applemobilitytrends-2020-05-24.csv.
+
+In addition, downloaded following data:
+- Norwegian holidays (_helligdagskalender-4.csv_ [download here](https://open.stavanger.kommune.no/dataset/helligdagskalender/resource/db9b2cd7-de60-4467-9a16-e2f4a7777b5b))
+- Historic weather data (_Weather1.csv_ .., [download here](https://klimaservicesenter.no/observations/))
+- Dates for non medical interventions (_NMI.csv_ .., [see here](https://www.vg.no/spesial/2020/corona/?utm_source=coronav))
+
+We start by formatting data about Norwegian holidays, weather, and non medical interventions.
+
+```{r format_data}
+weather = 
+  rbind(fread("Weather1.csv"),
+        fread("Weather2.csv"),
+        fread("Weather3.csv")) %>%
+  .[Navn != "Data er gyldig per 26.05.2020 (CC BY 4.0), Meteorologisk institutt (MET)"] %>%
+  .[Navn == "Oslo - Blindern", region := "Oslo"] %>%
+  .[Navn == "Arendal Lufthavn", region := "Agder"] %>%
+  .[Navn == "Kristiansand - Sømskleiva", region := "Agder"] %>%
+  .[Navn == "Hamar Ii", region := "Innlandet"] %>%
+  .[Navn == "Ålesund Iv", region := "Møre og Romsdal"] %>%
+  .[Navn == "Bodø Vi", region := "Nordland"] %>%
+  .[Navn == "Stavanger - Våland", region := "Rogaland"] %>%
+  .[Navn == "Tromsø", region := "Troms og Finnmark"] %>%
+  .[Navn == "Trondheim - Risvollan", region := "Trøndelag"] %>%
+  .[Navn == "Gjerpen - Århus", region := "Vestfold og Telemark"] %>%
+  .[Navn == "Bergen - Sandsli", region := "Vestland"] %>%
+  .[Navn == "Drammen - Berskog", region := "Viken"] %>%
+  .[, c("Navn","Stasjon") := NULL] %>%
+  setnames(c("Minimumstemperatur (døgn)",
+             "Middeltemperatur (døgn)",
+             "Maksimumstemperatur (døgn)",
+             "Tid(norsk normaltid)"),
+           c("temp_min","temp_avg","temp_max","date")) %>%
+  .[, date := as.Date(date, format = "%d.%m.%Y")] %>%
+  .[, temp_avg := sub("-","",temp_avg)] %>%
+  .[, temp_max := sub("-","",temp_max)] %>%
+  .[, temp_min := sub("-","",temp_min)] %>%
+  .[, temp_avg := as.numeric(sub(",",".",temp_avg))] %>%
+  .[, temp_max := as.numeric(sub(",",".",temp_max))] %>%
+  .[, temp_min := as.numeric(sub(",",".",temp_min))] %>%
+  .[, list(temp_avg = mean(temp_avg, na.rm = T),
+           temp_min = mean(temp_min, na.rm = T),
+           temp_max = mean(temp_max, na.rm = T)),
+    by = c("date","region")] %>%
+  .[is.na(temp_avg), temp_avg := (temp_min + temp_max)/2 ]
+
+
+holidays = fread("helligdagskalender-4.csv") %>%
+  .[år == 2020] %>%
+  .[, date := as.Date(dato, format = "%d.%m.%Y")] 
+
+NMI = fread("NMI.csv") %>%
+  .[, start_date := as.Date(start_date, format = "%d.%m.%Y")] %>%
+  .[, stop_date := as.Date(stop_date, format = "%d.%m.%Y")] %>%
+  .[is.na(stop_date), stop_date := as.Date("2020-05-31")]
+```
+
+Here is a quick look at the intervention data.
+
+```{r plot_NMI, fig.width=9}
+NMIl = 
+  NMI %>% melt(id.vars = "intervention",
+               value.name = "date") %>%
+  .[, y := as.numeric(factor(intervention))]
+
+add_dates = list(
+  geom_vline(xintercept = as.Date("2020-03-12"), col = "red", lty = 3), 
+  geom_vline(xintercept = NMI[intervention == "CloseKindergarten", stop_date], col = "green3", lty = 3),
+  geom_vline(xintercept = NMI[intervention == "CloseSchool1", stop_date], col = "green3", lty = 3), 
+  geom_vline(xintercept = NMI[intervention == "CloseSchool2", stop_date], col = "green3", lty = 3)
+)
+  
+
+ggplot(NMIl, aes(x = date, y = y, label = intervention, group = intervention)) + 
+  geom_line() + 
+  geom_vline(xintercept = as.Date("2020-03-12"), col = "red") + 
+  geom_vline(xintercept = Sys.Date(), col = "grey") + 
+  geom_text(data = NMIl[variable == "start_date"], nudge_y = .25,hjust = "left") + 
+  xlim(as.Date("2020-03-10"),as.Date("2020-06-10")) +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+```
+
+The red line indicates start of the "lock down" period and black horizontal lines indicate start and duration of different NMIs. The grey vertical line is the current date. School1 and School2 refer to grades 1-4 and 5 and above, respectively.
+
+
+Next we load Google and Apple mobility data and merge all data.
+
+```{r load_merge_mobility, warning = F}
+load("GoogleMobilityData.Rdata")
+goo = 
+  goo %>% 
+  .[country_region_code == "NO"] %>%
+  .[, c("country_region_code","country_region","sub_region_2") := NULL] %>% 
+  melt(id.vars = c("date","sub_region_1"), value.name = "y") %>%
+  .[, variable := gsub("_percent_change_from_baseline","",variable)] %>% 
+  .[sub_region_1 == "", sub_region_1 := "Norway"] %>%
+  .[, date := as.Date(date)] %>%
+  setnames(c("sub_region_1","variable"),c("region","location")) %>%
+  .[, src := "Google"]
+
+apl = fread(dir(,pattern = "applemobilitytrends"))  %>%
+  .[country == "Norway"] %>%
+  .[, c("geo_type","alternative_name","country","sub-region") := NULL] %>%
+  melt(id.vars = c("region","transportation_type"),value.name = "y") %>%
+  .[, variable := as.Date(as.character(variable),format = "%Y-%m-%d")] %>% 
+  setnames(c("transportation_type","variable"),c("location","date")) %>% 
+  .[, y := y -100] %>%
+  .[, src := "Apple"]
+
+dt = 
+  rbind(goo,apl) %>%
+  .[, weekday := factor(weekdays(date),
+                        level = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))] %>%
+  .[, weekend := weekday %in% c("Saturday","Sunday")] %>%
+  .[, holiday := ifelse(date %in% holidays$date, T, F) ] %>%
+  .[, src := factor(src,levels = c("Google","Apple"))] %>%
+  merge(weather, by = c("region","date"), all.x = T, all.y = F)
+
+```
+
+To illustrate the data, we show relative mobility with Google's _transit_stations_ and apples _driving_ variable.
+
+```{r show_data, fig.width=8, fig.height=6}
+ggplot(dt[location %in% c("driving","transit_stations")],
+       aes(x = date, y = y, lty = src, color = region)) +
+  geom_hline(yintercept = 0, color = "grey") + 
+  geom_line(stat = "identity") +
+  theme(legend.position="top") + 
+  facet_wrap(~src, nrow = 2, scale = "free_y") + 
+  theme(legend.text=element_text(size=8)) + 
+  add_dates
+```
+
+Red and green vertical lines indicate start of lockdown and openings of kindergarten and schools. A first important insight from this plot is the considerable variation between fylke. The plot also shows that Apple data span a longer period^[for some reason two days of data are entirely missing], but only the driving "location is available on fylke level.
+
+## Analysis
+
+Next, we are defining a following variables for the analysis:
+
+- `lock.down` is $1$ for all days including and after march 12. 2020 and $0$ for the days before that.
+- `lock.down.smooth` is a variable that captures gradual implementation of the lock down in the first week starting with march 12. 2020.
+- `open.kindergarten` is $1$ for the one week where only the kindergartens (but not schools) were open again and $0$ for all other days.
+- `open.KGschool1` is $1$ from April 27th on until May 10th and otherwise $0$ and capture effects of having kindergartens _and_ elementary schools open again.
+- `open.KGschool2` is $1$ from May 10th on and otherwise $0$ and capture effects of having kindergartens _and_ elementary and middle schools open again.
+
+The following figure describes this visually, whereby lines indicate teh perior for which a variable has non-zero values.
+
+```{r define_analysis_vars, warning = F}
+dt = 
+  dt %>%
+  .[, lock.down := ifelse(date >= as.Date("2020-03-12"),1,0)] %>%
+  .[, lock.down.smooth := 0]  %>%
+  .[date > as.Date("2020-03-11") & date < (as.Date("2020-03-11")+8), lock.down.smooth := scale(1:7), by = c("region","location")] %>%
+  .[, open.kindergarten := ifelse(date >= NMI[intervention == "CloseKindergarten",stop_date] & 
+                                    date < NMI[intervention == "CloseSchool1",stop_date],1, 0)] %>%
+  .[, open.KGschool1 := ifelse(date >= NMI[intervention == "CloseSchool1",stop_date] & 
+                                    date < NMI[intervention == "CloseSchool2",stop_date],1,0)]  %>%
+  .[, open.KGschool2 := ifelse(date >= NMI[intervention == "CloseSchool2",stop_date],1,0)]  %>%
+  .[, open.group := ifelse(date >= NMI[intervention == "ProhibitGroups5_20",stop_date],1,0)]
+
+tmp = unique(dt[,c("date","lock.down","lock.down.smooth","open.kindergarten",
+                   "open.KGschool1","open.KGschool2")]) %>% 
+  .[date > as.Date("2020-03-11") & date < as.Date("2020-03-19"), lock.down.smooth := (lock.down.smooth+2)/2.8] %>% 
+  melt(id.vars = "date", variable.name = "measure") %>%
+  .[value == 0, value := NA] %>%
+  .[,value := as.numeric(factor(measure)) + value/2]
+label_data = 
+  tmp[date == as.Date("2020-03-02")] %>%
+  .[,value := as.numeric(factor(measure))+.5]
+ggplot(tmp, aes(x = date, y = value, group = measure, label = measure)) + 
+  geom_line() + 
+  geom_text(data = label_data) + 
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  xlim(as.Date("2020-02-10"),as.Date("2020-06-10"))
+
+dt =
+dt %>% 
+  .[, sdy := sd(y,na.rm = T), by = c("region","location")] %>% 
+  .[, my := median(y,na.rm = T), by = c("region","location")] %>% 
+  .[,outlier := ifelse(abs(my-y) > (4*sdy),T,F),by = 1:nrow(dt)] %>% 
+  .[outlier != T] %>% 
+  .[,c("sdy","my","outlier") := NULL]
+```
+
+### Regression model
+
+To estimation the association of start and top of NMI with mobility we use following hierarchical regression model:
+
+$rm_j \sim 1 + lockdown + opening_i + nuisance_k + (1 + lockdown + opening_i + nuisance_k | region)$
+
+- where $rm_j$ is the relative time spent at location $j$ (we start by looking only at one location)
+- $lockdown$ includes lock.down` and lock.down.smooth` described above
+- $opening_i$ includes `open.kindergarten`, `open.KGschool1`, and `open.KGschool2`
+- $nuisance_i$ are nuisance terms, in particular `weekday` (Monday-Sunday), `holiday`, `date` (as a numeric variable), and `temp_avg`, the average temperature for each day.
+
+The term  $(1 + lockdown + opening_i + nuisance_i | region)$ specifies a random-intercept, random-slope model, which we use to capture that mobility in general and the effect of lock-down and opening might vary between fylke. We also estimate the error term as a random effect, such that it can vary between lock.down on and off, and between fylke (`sigma ~ lock.down + (lock.down | region)`).
+
+
+### Google: Transit stations
+We start with a simple regression model for Google data and the _transit_stations_ location. We are using a Bayesian approach here, because ML estimation of hierarchical models can have problem with estimating variations between groups (i.e. the ML estimate but not the expectation of the sd for random effects might be at 0).^[More generally, I think NHST does as much harm as good, so I have a general preferences for Bayesian Methods.]
+
+
+```{r fit_hlm_google}
+dtx = dt[region != "Norway" & location == "transit_stations" & !is.na(y)] %>%
+  .[, sdate := scale(date)]
+
+model_formula = 
+  bf(
+  y ~ 0 + weekday + lock.down + open.kindergarten + open.KGschool1 + open.KGschool2 + poly(lock.down.smooth,2) + holiday + sdate + temp_avg +
+  (0 + weekday + lock.down + open.kindergarten + open.KGschool1 + open.KGschool2 + poly(lock.down.smooth,2) + holiday + sdate + temp_avg  | region),
+  sigma ~ lock.down + (1 | region))
+
+if (file.exists("hlmgoogle_transit.Rdata")) {
+  load("hlmgoogle_transit.Rdata")
+} else {
+  hlmfit = brm(model_formula,
+               data = data.frame(dtx))
+  save(hlmfit,file= "hlmgoogle_transit.Rdata")
+}
+```
+
+Before we look at the results, let's check if the model converged by verifying that the variance inflation factor is below 1.1 for all parameters.^[There is more one can do, but I don't want to make this a tutorial into a work-flow for Bayesian statistics].
+
+```{r check_hat, warning=F}
+ggplot(data.frame(Rhat = rhat(hlmfit)), aes(x = Rhat)) + geom_histogram(bins = 10, fill = adjustcolor("blue",alpha = .5))
+```
+
+Next we compare predicted and observed mobility to see if the fitted model describes the data reasonably well, that is we do a __posterior predictive check__. The idea here is that if the model and fitted parameters do not describe the data well, our model-specification might be problematic, which would in turn undermine our confidence into the results. The posterior predictive check shows model-predictions (thin blue lines) and observed data in the same plot. Note that we hve not one but many model-predictions, because the Bayesian approach assumes that model parameters are random variables. Here we show a random selection of 50 model predictions.
+
+```{r pp_plot, fig.height=9, fig.width=9}
+pp = 
+  dtx[,c("date","region")] %>%
+  cbind(t(posterior_predict(hlmfit))) %>%
+  melt(id.vars = c("date","region"), variable.name = "iter", value.name = "est") %>%
+  .[,iter := as.numeric(gsub("V","",iter))]
+
+ggplot(pp[iter < 50], aes(x = date, y = est, group = iter)) +
+  geom_line(stat = "identity", alpha = .05, colour = "blue") +
+  facet_wrap(~region) + 
+  geom_line(data = dtx, aes(x = date, y = y, group = NA), color = "red") + add_dates
+
+```
+
+This looks good enough to me. Note that it looks as if mobility increases a bit before openings begin. One could explore if people increases mobility already when lessening of restrictions are announced.
+
+Next we can look at associations with lock-down and opening. The following figure shows the "fixed effect" as a grey vertical line with a grey 90% credible interval and fylke-level random effects as dots with 90% credible intervals.
+
+```{r plot_lockdown_transition}
+median_ci = function(samples,var,by = NULL) {
+  samples[, list(median = median(get(var)),
+                 lower = quantile(get(var),.05),
+                 upper = quantile(get(var),.95)),
+          by = by]
+}
+
+plot_re = function(model_fit, var, group) {
+  FE = 
+    model_fit %>% spread_draws(!!as.symbol(paste0("b_",var))) %>%
+    data.table() %>%
+    setnames(paste0("b_",var),"fe")
+  
+  RE = 
+    model_fit %>% 
+    spread_draws(r_region[i,j]) %>% 
+    data.table() %>%
+    .[j == var] %>%
+    .[, j := NULL] %>% 
+    setnames(c("r_region","i"),c("re","region")) %>% 
+    merge(FE, by = c(".chain",".iteration",".draw")) %>%
+    .[, re := re + fe] %>%
+    median_ci(var = "re",by = "region")
+   
+  FE = 
+    FE %>%
+    median_ci(var = "fe")
+  
+  p = ggplot(RE, aes(x = region, y = median)) + 
+    geom_rect(xmax = Inf, ymax =  FE$upper, 
+              xmin = -Inf, ymin =  FE$lower, fill = 'grey95') +
+    geom_hline(yintercept = FE$median, color = "grey") +
+    geom_point() + 
+    geom_linerange(aes(ymin = lower, ymax = upper)) + 
+    xlab("fylke") + ylab(paste("Effect of",var)) + 
+    coord_flip()
+  return(p)
+}
+
+plot_fe = function(model_fit, vars) {
+  FE = c()
+  for (var in vars) {
+    FE = rbind(FE,
+               model_fit %>% spread_draws(!!as.symbol(paste0("b_",var))) %>%
+                 data.table() %>%
+                 .[, predictor := var] %>%
+                 setnames(paste0("b_",var),"fe"))
+  }
+  FE = median_ci(FE,var = "fe",by = "predictor")
+  p = ggplot(FE, aes(x = predictor, y = median)) +
+    geom_hline(yintercept = 0, col = "red") +
+    geom_point() + 
+    geom_linerange(aes(ymin = lower, ymax = upper)) + 
+    coord_flip() + 
+    ylab("Estimated change in mobility")
+  return(p)
+}
+
+plot_re(hlmfit,"lock.down")
+```
+
+On average, lock-down decreased the relative time at transition stations by nearly 60%. There are also noticeable differences between fylke.
+
+Next we look at the (fixed) effects of opening:
+
+```{r plot_open_fe_transit, fig.height=3}
+vars = c("open.kindergarten","open.KGschool1","open.KGschool2")
+plot_fe(hlmfit, vars =vars)
+```
+
+Opening schools was associated with more mobility, and the more institutions opened, the more mobility increased.
+
+Finally, we can also look at random effects for opening.
+```{r plot_open_re_transit, fig.width=9, fig.height=4}
+p1 = plot_re(hlmfit,"open.kindergarten") +
+  geom_hline(yintercept = 0, col = "red")
+p2 = plot_re(hlmfit,"open.KGschool1") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+p3 = plot_re(hlmfit,"open.KGschool2") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+p1 + p2 + p3 
+```
+
+There are some clear differences between fylke in the effect of opening: Fylke dominated by large cities see weaker increases in stays at transit stations. One possible explanation is that kindergartens in cities can be reached on foot or by bike.
+
+### Apple: Driving
+
+We repeat the same analysis for Apple's driving data.
+
+```{r fit_hlm_apple}
+dtx = dt[region != "Norway" & location == "driving" & !is.na(y)] %>%
+  .[, sdate := scale(date)]
+
+if (file.exists("hlmapple_driving.Rdata")) {
+  load("hlmapple_driving.Rdata")
+} else {
+  hlmfit = brm(model_formula,
+               data = data.frame(dtx))
+  save(hlmfit,file= "hlmapple_driving.Rdata")
+}
+```
+
+Convergence:
+```{r check_hat2, warning=F}
+ggplot(data.frame(Rhat = rhat(hlmfit)), aes(x = Rhat)) + geom_histogram(bins = 10, fill = adjustcolor("blue",alpha = .5))
+```
+
+Posterior predictive check:
+```{r pp_plot2, fig.height=9, fig.width=9, warning = F}
+pp = 
+  dtx[,c("date","region")] %>%
+  cbind(t(posterior_predict(hlmfit))) %>%
+  melt(id.vars = c("date","region"), variable.name = "iter", value.name = "est") %>%
+  .[,iter := as.numeric(gsub("V","",iter))]
+
+ggplot(pp[iter < 50], aes(x = date, y = est, group = iter)) +
+  geom_line(stat = "identity", alpha = .05, colour = "blue") +
+  facet_wrap(~region) + 
+  geom_line(data = dtx, aes(x = date, y = y, group = NA), color = "red") +
+  add_dates
+
+```
+
+Lock-down effects:
+```{r}
+plot_re(hlmfit,"lock.down")
+```
+
+Unsurprisingly, we see again strong effects of the lock down.
+Something is off with _Innlandet_. The problem is probably the spike
+
+
+Next we look again at the fixed effects for openings:
+
+```{r plot_open_fe_driving, fig.height=3}
+vars = c("open.kindergarten","open.KGschool1","open.KGschool2")
+plot_fe(hlmfit, vars =vars)
+```
+
+Variation between fylke:
+```{r plot_results2, fig.width=9, fig.height=4}
+p1 = plot_re(hlmfit,"open.kindergarten") +
+  geom_hline(yintercept = 0, col = "red")
+p2 = plot_re(hlmfit,"open.KGschool1") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+p3 = plot_re(hlmfit,"open.KGschool2") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+
+p1 + p2 + p3
+```
+
+These results indcate relatively little variation between fylke in opening-associated changes in driving behavior.
+
+
+### Google: Workplace
+
+The results so far were expected. On the one hand, this is not very exciting. On the other hand, the coincidence of plausible expectations with model results speaks in favor of the validity of the modeling approach. 
+
+With such an approach in hand, we can contiue to a more interesting question: Did peoplego more frequently to there work places, as restrictions were eased, but the recommendation to work from at home remained the same?
+
+
+```{r fit_hlm_google_workplaces}
+dtx = dt[region != "Norway" & location == "workplaces" & !is.na(y)] %>%
+  .[, sdate := scale(date)]
+
+if (file.exists("hlmgoogle_workplaces.Rdata")) {
+  load("hlmgoogle_workplaces.Rdata")
+} else {
+  hlmfit = brm(model_formula,
+               data = data.frame(dtx))
+  save(hlmfit,file= "hlmgoogle_workplaces.Rdata")
+}
+```
+
+We check convergence.
+
+```{r check_hat_workplaces, warning=F}
+ggplot(data.frame(Rhat = rhat(hlmfit)), aes(x = Rhat)) + geom_histogram(bins = 10, fill = adjustcolor("blue",alpha = .5))
+```
+
+We investigate the posterior predictive plot:
+
+```{r pp_plot_workplaces, fig.height=9, fig.width=9}
+pp = 
+  dtx[,c("date","region")] %>%
+  cbind(t(posterior_predict(hlmfit))) %>%
+  melt(id.vars = c("date","region"), variable.name = "iter", value.name = "est") %>%
+  .[,iter := as.numeric(gsub("V","",iter))]
+
+ggplot(pp[iter < 50], aes(x = date, y = est, group = iter)) +
+  geom_line(stat = "identity", alpha = .05, colour = "blue") +
+  facet_wrap(~region) + 
+  geom_line(data = dtx, aes(x = date, y = y, group = NA), color = "red") +
+  add_dates
+
+```
+
+Here it looks as if the model imposes the strong periodicity that begins only after the lock down to the before lock-down period. On could try to deal with that with a slightly more complex model, but I am not doing this now as we are mainly interested in the lock down period.
+
+
+Before we look at the effect of lockdown, we can interogate the weekday and holiday effects:
+
+```{r weekdays_workplace, fig.height=3}
+wkdys = c(paste0("weekday",c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")),"holidayTRUE")
+p = plot_fe(hlmfit,wkdys)
+p$data$predictor = 
+  factor(gsub("weekday|TRUE","",p$data$predictor),
+         levels = gsub("weekday|TRUE","",wkdys))
+p
+```
+
+As expected, people don't go to work on holidays. But it curiously looks as if people wore, compared to baseline, more at work on saturday and sundays.
+
+Next we can look at associations with lock-down. 
+
+```{r plot_lockdown_workplaces}
+plot_re(hlmfit,"lock.down")
+```
+
+On average, lock-down decreased the relative time at workplaces stations by around 45%. There are also noticeable differences between fylke: People in Oslo seem to work from home more than people in other fylke. One banal explanation is that the proportion of people with office jobs is higher in Oslo.
+
+Next we look at the (fixed) effects of opening:
+
+```{r plot_open_fe_workplaces, fig.height=3}
+vars = c("open.kindergarten","open.KGschool1","open.KGschool2")
+plot_fe(hlmfit, vars =vars)
+```
+
+Interestingly, we see a clear increase in time at the workplace, especially after the second school opening. The difference to the analysis of the _transit_station_ and _driving_ data is that there the main "effect" occurred with the opening of the kindergarten and opening of schools had only a small effect, whereas here opening of schools for children in the 5th grad an higher had a major additional "effect".
+
+Finally, we can also look at random effects for opening.
+```{r plot_open_re_workplaces, fig.width=9, fig.height=4}
+p1 = plot_re(hlmfit,"open.kindergarten") +
+  geom_hline(yintercept = 0, col = "red")
+p2 = plot_re(hlmfit,"open.KGschool1") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+p3 = plot_re(hlmfit,"open.KGschool2") + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.length.y = unit(0,"cm")) + 
+  xlab("") +
+  geom_hline(yintercept = 0, col = "red")
+p1 + p2 + p3 
+```
+
+There is little evidence for variation of these effects between fylke.
+
+## Summary:
+- There is a clear association between non medical interventions against covid-10 in the expected direction
+- There is some variation between fylke, but the extent of this variation differs depending on which "effects" one looked at.
+- It looks as if mobility increases beyond the domains of life for which restrictions were lifted (schools open, people go more to their work places. This can either indicate that not all people who work in critical occupations could send their children to school, or that people who do not work in critical occupations start visiting their working places when they don't need to attend to children at home, even though recommendations are that one should stay at home).
+- One interesting hypothesis to examine is to check if mobility increases when openings are announced, as opposed to when openings officially start.
+- Another interesting obervation is the people are more at work on staturdays and sundays. A first step here would to examine this might be an artifact of the way by which Google sets the baseline.
